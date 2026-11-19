@@ -7,11 +7,11 @@ mod crash;
 pub(crate) mod logging;
 mod sources_cli;
 
-use std::io::Write;
+use std::io::{BufRead as _, Write};
 
-use crate::cli::{Cli, Cmd, JsonArgs, SourceArgs, SourceIdArgs, SourcesAction};
-use crate::{config, doctor, floating, install, runtime, sources};
-use anyhow::Result;
+use crate::cli::{Cli, Cmd, JsonArgs, SourceArgs, SourceIdArgs, SourcesAction, T3Action};
+use crate::{config, doctor, floating, install, runtime, sources, t3_code};
+use anyhow::{Context as _, Result};
 use clap::Parser;
 
 /// Run the command line's subcommand.
@@ -208,6 +208,35 @@ fn dispatch(cmd: Cmd, drift: doctor::DriftSeen) -> Result<Option<runtime::QuitSi
             sources_cli::run_change(&ids, json, sources::disconnect)?;
             None
         }
+        Cmd::T3 {
+            action: T3Action::Connect,
+        } => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Paste the one-time T3 Code pairing URL and press Enter:"
+            );
+            let mut pairing_url = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut pairing_url)
+                .context("reading the T3 Code pairing URL")?;
+            let pairing_url = pairing_url.trim();
+            if pairing_url.is_empty() {
+                anyhow::bail!("T3 Code pairing URL is required.");
+            }
+            let credential =
+                runtime::on_runtime(|rt| rt.block_on(t3_code::exchange_pairing_url(pairing_url)))??;
+            t3_code::save_credential(&credential)?;
+            writeln!(crate::cli_stdout(), "Connected to T3 Code (read-only).")?;
+            None
+        }
+        Cmd::T3 {
+            action: T3Action::Disconnect,
+        } => {
+            t3_code::disconnect()?;
+            writeln!(crate::cli_stdout(), "Disconnected from T3 Code.")?;
+            None
+        }
         Cmd::Setup { yes } => {
             sources_cli::run_setup(yes)?;
             None
@@ -253,7 +282,10 @@ fn build_run_config(
         cli_look.protocol,
     );
     let motion = config::resolve_motion(&cfg, &mut cfg_warnings);
-    let connected = sources::connected(&cfg);
+    let mut connected = sources::connected(&cfg);
+    if t3_code::has_credential() {
+        connected.insert(t3_code::SOURCE_NAME.to_owned());
+    }
     let first_run = sources::is_first_run(&connected, load_degraded);
     if !headless {
         // Config problems must reach stderr BEFORE any alternate screen / window,

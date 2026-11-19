@@ -23,6 +23,15 @@ pub enum Transport {
     Hook,
     /// Read from a transcript JSONL file (may be a historical replay).
     Jsonl,
+    /// Observed through a read-only remote snapshot rather than local hooks or transcripts.
+    Observer,
+}
+
+impl Transport {
+    /// Whether this transport carries current activity rather than transcript history.
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Hook | Self::Observer)
+    }
 }
 
 /// Structured tool detail, so the reducer can pattern-match (instead of

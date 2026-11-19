@@ -331,7 +331,7 @@ impl ActionRequests {
                 Some(t) => Some(t) == turn || Some(t) == implied,
                 // The transcript may read a turn's end past a hook's fresh
                 // raise, so it answers only its own.
-                None => turnless && (from == Transport::Hook || req.raised_on == Transport::Jsonl),
+                None => turnless && (from.is_live() || req.raised_on == Transport::Jsonl),
             },
             Seen::Resolved(Resolution::Turn(k)) => req.turn.as_ref() == Some(k),
             // The child resumed, unless a member is the parent's own call.
@@ -446,6 +446,7 @@ mod tests {
 
     const HOOK: Transport = Transport::Hook;
     const JSONL: Transport = Transport::Jsonl;
+    const OBSERVER: Transport = Transport::Observer;
 
     fn id() -> AgentId {
         AgentId::from_parts("claude-code", "s")
@@ -960,6 +961,22 @@ mod tests {
         };
         reqs.end(id(), start_unseen, HOOK, false);
         assert_eq!(calls(&reqs), ["b"], "a turnless end retires the turnless");
+    }
+
+    #[test]
+    fn a_live_observer_turn_end_resolves_a_turnless_request() {
+        let mut reqs = raised(vec![], raise(None, None, OBSERVER));
+        assert!(reqs.end(
+            id(),
+            Ended::Turn {
+                turn: None,
+                implied: None,
+                turnless: true,
+            },
+            OBSERVER,
+            true,
+        ));
+        assert!(!reqs.contains(&id()));
     }
 
     /// A pre-use and its start, or the two transports' starts of one call,

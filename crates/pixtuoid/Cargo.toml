@@ -75,6 +75,8 @@ yaml-edit          = { version = "0.3.6", default-features = false }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The T3 Code read-only snapshot observer and pairing flow use verified HTTPS.
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 # The log sinks' worker thread, which a stalled reader or a hung disk parks
 # instead of the `tracing` caller.
 tracing-appender   = "0.2"

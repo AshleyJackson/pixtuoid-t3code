@@ -137,8 +137,8 @@ rtrb = { version = "0.4.0", optional = true }
 [features]
 # `portable` is the build docs/CONFIGURATION.md offers where libasound is
 # absent, so a new default feature goes in it unless it needs a system library.
-default = ["audio", "portable", "t3-code-observer"]
-portable = ["serve"]
+default = ["audio", "portable"]
+portable = ["serve", "t3-code-observer"]
 # Ambient sound (config-OFF at runtime regardless; this gates the DEPENDENCY).
 audio = ["dep:rodio", "dep:rtrb"]
 # `pixtuoid serve` and `pixtuoid pair`. ring's build script compiles C for the

@@ -29,7 +29,7 @@ pub enum Transport {
 
 impl Transport {
     /// Whether a turnless end can answer a current request that replayed history may predate.
-    pub const fn is_live(self) -> bool {
+    pub(crate) const fn is_live(self) -> bool {
         matches!(self, Self::Hook | Self::Observer)
     }
 }

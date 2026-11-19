@@ -472,6 +472,7 @@ fn normalize_shell_snapshot(raw: Value) -> Result<Vec<ObservedThread>> {
     }
 
     let mut observed = Vec::new();
+    let mut expanded_workspace_root_bytes = 0usize;
     for value in threads {
         let thread = value
             .as_object()
@@ -522,12 +523,24 @@ fn normalize_shell_snapshot(raw: Value) -> Result<Vec<ObservedThread>> {
             ObservedStatus::Done
         };
         let project_id = string_field(thread.get("projectId")).unwrap_or_default();
+        let project_dir = project_dirs
+            .get(project_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(""));
+        // The reducer retains one cwd per agent, so shared roots still expand per thread.
+        if !project_dir.is_empty() {
+            expanded_workspace_root_bytes = expanded_workspace_root_bytes
+                .checked_add(project_dir.len())
+                .filter(|size| *size <= MAX_SHELL_RESPONSE_BYTES)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "T3 Code shell snapshot expands workspace roots beyond the response size limit"
+                    )
+                })?;
+        }
         observed.push(ObservedThread {
             id: id.to_owned(),
-            project_dir: project_dirs
-                .get(project_id)
-                .cloned()
-                .unwrap_or_else(|| Arc::from("")),
+            project_dir,
             status: observed_status,
         });
     }
@@ -1109,6 +1122,50 @@ mod tests {
                 < MAX_SHELL_RESPONSE_BYTES
         );
         assert!(normalize_shell_snapshot(snapshot).is_err());
+    }
+
+    #[test]
+    fn snapshot_bounds_workspace_root_bytes_across_live_threads() {
+        let workspace_root = "x".repeat(MAX_WORKSPACE_ROOT_BYTES);
+        let threads_at_limit = MAX_SHELL_RESPONSE_BYTES / workspace_root.len();
+        let snapshot_with_threads = |thread_count| {
+            json!({
+                "projects": [{
+                    "id": "project-1",
+                    "workspaceRoot": workspace_root.clone()
+                }],
+                "threads": (0..thread_count)
+                    .map(|index| json!({
+                        "id": format!("thread-{index}"),
+                        "projectId": "project-1",
+                        "status": "running"
+                    }))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let at_limit = snapshot_with_threads(threads_at_limit);
+        assert!(
+            serde_json::to_vec(&at_limit)
+                .expect("serialize snapshot")
+                .len()
+                < MAX_SHELL_RESPONSE_BYTES
+        );
+        assert_eq!(
+            normalize_shell_snapshot(at_limit)
+                .expect("workspace-root expansion at the limit")
+                .len(),
+            threads_at_limit
+        );
+
+        let over_limit = snapshot_with_threads(threads_at_limit + 1);
+        assert!(
+            serde_json::to_vec(&over_limit)
+                .expect("serialize snapshot")
+                .len()
+                < MAX_SHELL_RESPONSE_BYTES
+        );
+        assert!(normalize_shell_snapshot(over_limit).is_err());
     }
 
     #[test]

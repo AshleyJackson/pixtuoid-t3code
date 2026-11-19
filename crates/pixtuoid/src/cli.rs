@@ -222,6 +222,7 @@ pub(crate) enum Cmd {
     ///
     /// `connect` reads the one-time pairing URL from stdin; `disconnect` removes
     /// the locally stored read token.
+    #[cfg(feature = "t3-code-observer")]
     T3 {
         #[command(subcommand)]
         action: T3Action,
@@ -273,6 +274,7 @@ pub(crate) enum SourcesAction {
 }
 
 #[derive(Debug, Subcommand)]
+#[cfg(feature = "t3-code-observer")]
 pub(crate) enum T3Action {
     /// Connect using a one-time pairing URL pasted into stdin.
     Connect,
@@ -748,6 +750,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "t3-code-observer")]
     fn t3_pairing_commands_parse_without_exposing_tokens_as_arguments() {
         let connect = Cli::try_parse_from(["pixtuoid", "t3", "connect"]).unwrap();
         assert!(matches!(

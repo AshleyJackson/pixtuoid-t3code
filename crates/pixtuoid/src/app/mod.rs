@@ -7,11 +7,19 @@ mod crash;
 pub(crate) mod logging;
 mod sources_cli;
 
-use std::io::{BufRead as _, Write};
+#[cfg(feature = "t3-code-observer")]
+use std::io::BufRead as _;
+use std::io::Write;
 
-use crate::cli::{Cli, Cmd, JsonArgs, SourceArgs, SourceIdArgs, SourcesAction, T3Action};
-use crate::{config, doctor, floating, install, runtime, sources, t3_code};
-use anyhow::{Context as _, Result};
+#[cfg(feature = "t3-code-observer")]
+use crate::cli::T3Action;
+use crate::cli::{Cli, Cmd, JsonArgs, SourceArgs, SourceIdArgs, SourcesAction};
+#[cfg(feature = "t3-code-observer")]
+use crate::t3_code;
+use crate::{config, doctor, floating, install, runtime, sources};
+#[cfg(feature = "t3-code-observer")]
+use anyhow::Context as _;
+use anyhow::Result;
 use clap::Parser;
 
 /// Run the command line's subcommand.
@@ -208,6 +216,7 @@ fn dispatch(cmd: Cmd, drift: doctor::DriftSeen) -> Result<Option<runtime::QuitSi
             sources_cli::run_change(&ids, json, sources::disconnect)?;
             None
         }
+        #[cfg(feature = "t3-code-observer")]
         Cmd::T3 {
             action: T3Action::Connect,
         } => {
@@ -230,6 +239,7 @@ fn dispatch(cmd: Cmd, drift: doctor::DriftSeen) -> Result<Option<runtime::QuitSi
             writeln!(crate::cli_stdout(), "Connected to T3 Code (read-only).")?;
             None
         }
+        #[cfg(feature = "t3-code-observer")]
         Cmd::T3 {
             action: T3Action::Disconnect,
         } => {
@@ -282,10 +292,15 @@ fn build_run_config(
         cli_look.protocol,
     );
     let motion = config::resolve_motion(&cfg, &mut cfg_warnings);
-    let mut connected = sources::connected(&cfg);
-    if t3_code::has_credential() {
-        connected.insert(t3_code::SOURCE_NAME.to_owned());
-    }
+    let connected = sources::connected(&cfg);
+    #[cfg(feature = "t3-code-observer")]
+    let connected = {
+        let mut connected = connected;
+        if t3_code::has_credential() {
+            connected.insert(t3_code::SOURCE_NAME.to_owned());
+        }
+        connected
+    };
     let first_run = sources::is_first_run(&connected, load_degraded);
     if !headless {
         // Config problems must reach stderr BEFORE any alternate screen / window,

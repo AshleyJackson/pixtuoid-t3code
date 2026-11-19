@@ -25,6 +25,8 @@ const PROTOCOL_HEADER: &str = "x-t3-orchestration-protocol";
 const PROTOCOL_VERSION: &str = "2";
 const MAX_THREAD_ID_BYTES: usize = 256;
 const MAX_CREDENTIAL_BYTES: u64 = 8 * 1024;
+const MAX_SHELL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOKEN_RESPONSE_BYTES: usize = MAX_CREDENTIAL_BYTES as usize;
 const OBSERVED_CALL_ID: &str = "t3-observed-turn";
 const OBSERVED_TOOL_NAME: &str = "T3";
 const OBSERVED_TOOL_DETAIL: &str = "Working in T3 Code";
@@ -97,6 +99,18 @@ fn save_credential_at(path: &Path, credential: &T3CodeCredential) -> Result<()> 
         bail!("Cannot save an invalid or expired T3 Code credential.");
     }
 
+    let mut serialized = serde_json::to_vec(&StoredCredential {
+        base_url: credential.base_url.clone(),
+        token: credential.token.clone(),
+        expires_at_ms: credential.expires_at_ms,
+        scope: TOKEN_SCOPE.to_owned(),
+    })
+    .context("serializing the T3 Code credential")?;
+    serialized.push(b'\n');
+    if serialized.len() > MAX_CREDENTIAL_BYTES as usize {
+        bail!("T3 Code credential exceeds the {MAX_CREDENTIAL_BYTES}-byte storage limit.");
+    }
+
     let directory = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("T3 Code credential path has no parent."))?;
@@ -106,17 +120,7 @@ fn save_credential_at(path: &Path, credential: &T3CodeCredential) -> Result<()> 
     let mut temp = tempfile::NamedTempFile::new_in(directory)
         .context("creating a temporary T3 Code credential file")?;
     set_private_file_permissions(temp.path())?;
-    serde_json::to_writer(
-        &mut temp,
-        &StoredCredential {
-            base_url: credential.base_url.clone(),
-            token: credential.token.clone(),
-            expires_at_ms: credential.expires_at_ms,
-            scope: TOKEN_SCOPE.to_owned(),
-        },
-    )
-    .context("serializing the T3 Code credential")?;
-    temp.write_all(b"\n")
+    temp.write_all(&serialized)
         .context("writing the T3 Code credential")?;
     temp.as_file()
         .sync_all()
@@ -207,7 +211,15 @@ fn unix_time_ms() -> Result<u64> {
 
 fn validate_base_url(input: &str) -> Result<Url> {
     let url = Url::parse(input).context("T3 Code URL must be an absolute HTTP(S) URL.")?;
-    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    let host = url.host_str().unwrap_or_default();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
     if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
         || !url.username().is_empty()
         || url.password().is_some()
@@ -271,6 +283,32 @@ fn http_client() -> Result<reqwest::Client> {
         .context("building the T3 Code HTTP client")
 }
 
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    limit: usize,
+    description: &str,
+) -> Result<Vec<u8>> {
+    let declared_length = response.content_length();
+    if declared_length.is_some_and(|length| length > limit as u64) {
+        bail!("T3 Code {description} response exceeds the {limit}-byte limit.");
+    }
+    let capacity = declared_length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default();
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading T3 Code {description} response"))?
+    {
+        if chunk.len() > limit - body.len() {
+            bail!("T3 Code {description} response exceeds the {limit}-byte limit.");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 pub(crate) async fn exchange_pairing_url(input: &str) -> Result<T3CodeCredential> {
     let (base_url, bootstrap_token) = parse_pairing_url(input)?;
     let client = http_client()?;
@@ -294,10 +332,11 @@ pub(crate) async fn exchange_pairing_url(input: &str) -> Result<T3CodeCredential
         );
     }
 
-    let body: Value = response
-        .json()
+    let bytes = read_bounded_response(response, MAX_TOKEN_RESPONSE_BYTES, "token exchange")
         .await
-        .context("T3 Code token exchange returned invalid JSON")?;
+        .context("reading the T3 Code token exchange response")?;
+    let body: Value =
+        serde_json::from_slice(&bytes).context("T3 Code token exchange returned invalid JSON")?;
     let token = body
         .get("access_token")
         .and_then(Value::as_str)
@@ -460,33 +499,41 @@ fn transition_events(
         Some(ObservedStatus::Permission | ObservedStatus::Input)
     );
     let mut events = Vec::new();
-    match next {
-        ObservedStatus::Active => {
-            if was_waiting {
-                events.push(AgentEvent::UserActionResolved {
-                    agent_id,
-                    by: Resolution::Call(OBSERVED_CALL_ID.to_owned()),
-                });
-            }
-            events.push(AgentEvent::tool_use_start(
-                agent_id,
-                Some(OBSERVED_CALL_ID.to_owned()),
-                Some(ToolDetail::Generic {
-                    display: OBSERVED_TOOL_DETAIL.to_owned(),
-                }),
-            ));
-        }
+    if was_waiting && matches!(next, ObservedStatus::Active | ObservedStatus::Done) {
+        events.push(AgentEvent::UserActionResolved {
+            agent_id,
+            by: Resolution::Call(OBSERVED_CALL_ID.to_owned()),
+        });
+    }
+    if previous == Some(ObservedStatus::Active)
+        && matches!(
+            next,
+            ObservedStatus::Permission | ObservedStatus::Input | ObservedStatus::Done
+        )
+    {
+        events.push(AgentEvent::ToolUseEnd {
+            agent_id,
+            tool_use_id: Some(OBSERVED_CALL_ID.to_owned()),
+        });
+    }
+    events.extend(status_events(agent_id, next));
+    events
+}
+
+fn status_events(agent_id: AgentId, status: ObservedStatus) -> Vec<AgentEvent> {
+    match status {
+        ObservedStatus::Active => vec![AgentEvent::tool_use_start(
+            agent_id,
+            Some(OBSERVED_CALL_ID.to_owned()),
+            Some(ToolDetail::Generic {
+                display: OBSERVED_TOOL_DETAIL.to_owned(),
+            }),
+        )],
         ObservedStatus::Permission | ObservedStatus::Input => {
-            if previous == Some(ObservedStatus::Active) {
-                events.push(AgentEvent::ToolUseEnd {
-                    agent_id,
-                    tool_use_id: Some(OBSERVED_CALL_ID.to_owned()),
-                });
-            }
-            events.push(AgentEvent::UserActionRequest {
+            vec![AgentEvent::UserActionRequest {
                 agent_id,
                 reason: Some(
-                    if next == ObservedStatus::Permission {
+                    if status == ObservedStatus::Permission {
                         PERMISSION_REASON
                     } else {
                         INPUT_REASON
@@ -496,28 +543,13 @@ fn transition_events(
                 tool_use_id: Some(OBSERVED_CALL_ID.to_owned()),
                 tool_name: Some(OBSERVED_TOOL_NAME.to_owned()),
                 turn: None,
-            });
+            }]
         }
-        ObservedStatus::Done => {
-            if previous == Some(ObservedStatus::Active) {
-                events.push(AgentEvent::ToolUseEnd {
-                    agent_id,
-                    tool_use_id: Some(OBSERVED_CALL_ID.to_owned()),
-                });
-            }
-            if was_waiting {
-                events.push(AgentEvent::UserActionResolved {
-                    agent_id,
-                    by: Resolution::Call(OBSERVED_CALL_ID.to_owned()),
-                });
-            }
-            events.push(AgentEvent::TurnEnd {
-                agent_id,
-                turn: None,
-            });
-        }
+        ObservedStatus::Done => vec![AgentEvent::TurnEnd {
+            agent_id,
+            turn: None,
+        }],
     }
-    events
 }
 
 pub(crate) struct T3CodeSource {
@@ -543,12 +575,37 @@ impl T3CodeSource {
                 response.status().as_u16()
             );
         }
+        let bytes = read_bounded_response(response, MAX_SHELL_RESPONSE_BYTES, "shell snapshot")
+            .await
+            .context("reading the T3 Code shell snapshot response")?;
         normalize_shell_snapshot(
-            response
-                .json()
-                .await
+            serde_json::from_slice(&bytes)
                 .context("T3 Code returned invalid shell snapshot JSON")?,
         )
+    }
+
+    async fn send_session_start(
+        &self,
+        tx: &TaggedSender,
+        thread: &ObservedThread,
+        agent_id: AgentId,
+    ) -> Result<bool> {
+        let cwd = if thread.project_dir.is_empty() {
+            PathBuf::from("T3 Code")
+        } else {
+            PathBuf::from(&thread.project_dir)
+        };
+        send_event(
+            tx,
+            AgentEvent::SessionStart {
+                agent_id,
+                source: SOURCE_NAME.to_owned(),
+                session_id: thread.id.clone(),
+                cwd,
+                parent_id: None,
+            },
+        )
+        .await
     }
 
     async fn reconcile(
@@ -556,56 +613,53 @@ impl T3CodeSource {
         threads: Vec<ObservedThread>,
         tracked: &mut HashMap<String, TrackedThread>,
         tx: &TaggedSender,
+        reconnected: bool,
     ) -> Result<bool> {
         let mut seen = HashSet::new();
         for thread in threads {
             seen.insert(thread.id.clone());
-            let tracked_thread = match tracked.get_mut(&thread.id) {
-                Some(tracked_thread) => tracked_thread,
-                None => {
-                    let agent_id = AgentId::from_parts(SOURCE_NAME, &thread.id);
-                    let cwd = if thread.project_dir.is_empty() {
-                        PathBuf::from("T3 Code")
-                    } else {
-                        PathBuf::from(&thread.project_dir)
-                    };
-                    if !send_event(
-                        tx,
-                        AgentEvent::SessionStart {
-                            agent_id,
-                            source: SOURCE_NAME.to_owned(),
-                            session_id: thread.id.clone(),
-                            cwd,
-                            parent_id: None,
-                        },
-                    )
-                    .await?
+            let tracked_thread = match tracked.get(&thread.id).copied() {
+                Some(tracked_thread) => {
+                    if reconnected
+                        && !self
+                            .send_session_start(tx, &thread, tracked_thread.agent_id)
+                            .await?
                     {
                         return Ok(false);
                     }
-                    tracked.insert(
-                        thread.id.clone(),
-                        TrackedThread {
-                            agent_id,
-                            status: ObservedStatus::Done,
-                        },
-                    );
-                    tracked
-                        .get_mut(&thread.id)
-                        .ok_or_else(|| anyhow::anyhow!("T3 Code tracking entry was not inserted"))?
+                    tracked_thread
+                }
+                None => {
+                    let agent_id = AgentId::from_parts(SOURCE_NAME, &thread.id);
+                    if !self.send_session_start(tx, &thread, agent_id).await? {
+                        return Ok(false);
+                    }
+                    let tracked_thread = TrackedThread {
+                        agent_id,
+                        status: ObservedStatus::Done,
+                    };
+                    tracked.insert(thread.id.clone(), tracked_thread);
+                    tracked_thread
                 }
             };
 
-            for event in transition_events(
+            let mut events = transition_events(
                 tracked_thread.agent_id,
                 Some(tracked_thread.status),
                 thread.status,
-            ) {
+            );
+            if reconnected && tracked_thread.status == thread.status {
+                events.extend(status_events(tracked_thread.agent_id, thread.status));
+            }
+            for event in events {
                 if !send_event(tx, event).await? {
                     return Ok(false);
                 }
             }
-            tracked_thread.status = thread.status;
+            tracked
+                .get_mut(&thread.id)
+                .ok_or_else(|| anyhow::anyhow!("T3 Code tracking entry was not inserted"))?
+                .status = thread.status;
             if !send_event(
                 tx,
                 AgentEvent::ProofOfLife {
@@ -665,7 +719,10 @@ impl Source for T3CodeSource {
             }
             match self.poll(&client, &endpoint).await {
                 Ok(threads) => {
-                    if !self.reconcile(threads, &mut tracked, &tx).await? {
+                    if !self
+                        .reconcile(threads, &mut tracked, &tx, warning_shown)
+                        .await?
+                    {
                         return Ok(());
                     }
                     if warning_shown {
@@ -697,15 +754,21 @@ async fn send_event(tx: &TaggedSender, event: AgentEvent) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use pixtuoid_core::state::ActivityState;
+    use pixtuoid_core::state::reducer::{EXIT_GRACE_WINDOW, STALE_TOOL_TIMEOUT};
+    use pixtuoid_core::{Reducer, SceneState};
     use serde_json::json;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
 
     use super::{
-        AgentEvent, MAX_CREDENTIAL_BYTES, ObservedStatus, ObservedThread, T3CodeCredential,
-        T3CodeSource, TrackedThread, Transport, normalize_shell_snapshot, parse_pairing_url,
-        save_credential_at, shell_snapshot_url, transition_events,
+        AgentEvent, MAX_CREDENTIAL_BYTES, MAX_SHELL_RESPONSE_BYTES, MAX_TOKEN_RESPONSE_BYTES,
+        ObservedStatus, ObservedThread, T3CodeCredential, T3CodeSource, TrackedThread, Transport,
+        normalize_shell_snapshot, parse_pairing_url, save_credential_at, shell_snapshot_url,
+        transition_events,
     };
 
     fn credential(token: &str) -> T3CodeCredential {
@@ -740,6 +803,31 @@ mod tests {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write local response");
+            request
+        });
+        (base_url, task)
+    }
+
+    async fn serve_once_without_content_length(
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local HTTP listener");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept local request");
+            let request = read_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
             );
             stream
                 .write_all(response.as_bytes())
@@ -793,6 +881,12 @@ mod tests {
         save_credential_at(&path, &second).expect("replace credential");
         let loaded = super::load_credential_at(&path, super::unix_time_ms().expect("clock"))
             .expect("load replacement");
+        assert_eq!(loaded.token, "second-secret");
+
+        let oversized = credential(&"x".repeat(MAX_CREDENTIAL_BYTES as usize));
+        assert!(save_credential_at(&path, &oversized).is_err());
+        let loaded = super::load_credential_at(&path, super::unix_time_ms().expect("clock"))
+            .expect("oversized replacement must preserve the saved credential");
         assert_eq!(loaded.token, "second-secret");
 
         #[cfg(unix)]
@@ -954,6 +1048,14 @@ mod tests {
         assert!(parse_pairing_url("https://t3.example/other#token=secret").is_err());
     }
 
+    #[test]
+    fn pairing_url_accepts_ipv6_loopback() {
+        assert_eq!(
+            parse_pairing_url("http://[::1]:3773/pair#token=one-time").expect("IPv6 pair URL"),
+            ("http://[::1]:3773".to_owned(), "one-time".to_owned())
+        );
+    }
+
     #[tokio::test]
     async fn pairing_exchange_requests_only_the_read_scope() {
         let (base_url, server) = serve_once(
@@ -1012,6 +1114,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shell_and_token_responses_without_content_length_are_bounded() {
+        let snapshot_body =
+            r#"{"projects":[],"threads":[]}"#.to_owned() + &" ".repeat(MAX_SHELL_RESPONSE_BYTES);
+        let (base_url, server) = serve_once_without_content_length(snapshot_body).await;
+        let source = T3CodeSource::new(T3CodeCredential {
+            base_url: base_url.clone(),
+            token: "observer-secret".to_owned(),
+            expires_at_ms: u64::MAX,
+        });
+        let endpoint = shell_snapshot_url(&base_url).expect("shell endpoint");
+        let error = match source
+            .poll(&super::http_client().expect("HTTP client"), &endpoint)
+            .await
+        {
+            Ok(_) => panic!("oversized snapshot must be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("exceeds"));
+        server.await.expect("local HTTP server");
+
+        let token_body = r#"{"access_token":"read-token","token_type":"Bearer","scope":"orchestration:read","expires_in":60}"#
+            .to_owned()
+            + &" ".repeat(MAX_TOKEN_RESPONSE_BYTES);
+        let (base_url, server) = serve_once_without_content_length(token_body).await;
+        let pairing_url = format!("{base_url}/pair#token=one-time-secret");
+        let error = super::exchange_pairing_url(&pairing_url)
+            .await
+            .expect_err("oversized token response must be rejected");
+        assert!(format!("{error:#}").contains("exceeds"));
+        server.await.expect("local HTTP server");
+    }
+
     #[test]
     fn status_transitions_emit_generic_activity_and_clear_waits() {
         let agent_id = pixtuoid_core::AgentId::from_parts("t3-code", "thread");
@@ -1067,7 +1202,7 @@ mod tests {
 
         assert!(
             source
-                .reconcile(vec![waiting], &mut tracked, &tx)
+                .reconcile(vec![waiting], &mut tracked, &tx, false)
                 .await
                 .expect("initial reconcile")
         );
@@ -1088,7 +1223,7 @@ mod tests {
         };
         assert!(
             source
-                .reconcile(vec![active], &mut tracked, &tx)
+                .reconcile(vec![active], &mut tracked, &tx, false)
                 .await
                 .expect("resume reconcile")
         );
@@ -1104,7 +1239,7 @@ mod tests {
 
         assert!(
             source
-                .reconcile(Vec::new(), &mut tracked, &tx)
+                .reconcile(Vec::new(), &mut tracked, &tx, false)
                 .await
                 .expect("removal reconcile")
         );
@@ -1116,6 +1251,73 @@ mod tests {
                 (Transport::Observer, AgentEvent::TurnEnd { .. }),
                 (Transport::Observer, AgentEvent::SessionEnd { .. })
             ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovery_reregisters_a_stale_removed_agent_from_the_same_snapshot() {
+        let source = T3CodeSource::new(credential("unused-in-reconcile-test"));
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut tracked = std::collections::HashMap::<String, TrackedThread>::new();
+        let mut reducer = Reducer::new();
+        let mut scene = SceneState::uniform(1);
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let snapshot = || {
+            vec![ObservedThread {
+                id: "thread-1".to_owned(),
+                project_dir: "/work/demo".to_owned(),
+                status: ObservedStatus::Active,
+            }]
+        };
+        let id = pixtuoid_core::AgentId::from_parts("t3-code", "thread-1");
+
+        assert!(
+            source
+                .reconcile(snapshot(), &mut tracked, &tx, false)
+                .await
+                .expect("initial reconcile")
+        );
+        for (transport, event) in drain(&mut rx) {
+            reducer.apply(&mut scene, event, t0, transport);
+        }
+        assert!(
+            scene.agents.contains_key(&id),
+            "initial observation registers"
+        );
+
+        let stale_at = t0 + STALE_TOOL_TIMEOUT + Duration::from_secs(1);
+        reducer.tick(&mut scene, stale_at);
+        reducer.tick(
+            &mut scene,
+            stale_at + EXIT_GRACE_WINDOW + Duration::from_secs(1),
+        );
+        assert!(
+            !scene.agents.contains_key(&id),
+            "the reducer removes the silent tracked agent during the outage"
+        );
+
+        let recovered_at = stale_at + EXIT_GRACE_WINDOW + Duration::from_secs(2);
+        assert!(
+            source
+                .reconcile(snapshot(), &mut tracked, &tx, true)
+                .await
+                .expect("reconcile after the observation outage")
+        );
+        let events = drain(&mut rx);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                (Transport::Observer, AgentEvent::SessionStart { .. }),
+                (Transport::Observer, AgentEvent::ToolUseStart { .. }),
+                (Transport::Observer, AgentEvent::ProofOfLife { .. })
+            ]
+        ));
+        for (transport, event) in events {
+            reducer.apply(&mut scene, event, recovered_at, transport);
+        }
+        assert!(matches!(
+            scene.agents.get(&id).map(|slot| &slot.state),
+            Some(ActivityState::Running { item: Some(_), .. })
         ));
     }
 }

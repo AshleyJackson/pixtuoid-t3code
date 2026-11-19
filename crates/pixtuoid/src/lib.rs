@@ -27,6 +27,7 @@ pub(crate) mod runtime;
 pub(crate) mod serve;
 pub(crate) mod snapshot_flags;
 pub(crate) mod sources;
+#[cfg(feature = "t3-code-observer")]
 pub(crate) mod t3_code;
 pub(crate) mod term;
 pub(crate) mod tui;

@@ -23,12 +23,12 @@ pub enum Transport {
     Hook,
     /// Read from a transcript JSONL file (may be a historical replay).
     Jsonl,
-    /// Observed through a read-only remote snapshot rather than local hooks or transcripts.
+    /// Live remote state can answer current requests; a replayed end may predate them.
     Observer,
 }
 
 impl Transport {
-    /// Whether this transport carries current activity rather than transcript history.
+    /// Whether a turnless end can answer a current request that replayed history may predate.
     pub const fn is_live(self) -> bool {
         matches!(self, Self::Hook | Self::Observer)
     }

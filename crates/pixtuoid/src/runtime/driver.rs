@@ -31,6 +31,8 @@ use super::gate;
 use super::pipeline::{HeadlessLog, SceneSink};
 use super::today::{DayCount, TodaySaver};
 use super::{ConnectedSources, QuitArms, QuitSignal, RunConfig, resolve_boot_caps};
+#[cfg(feature = "t3-code-observer")]
+use crate::t3_code::T3CodeSource;
 
 /// Boot the TUI (unless headless) and drive the source pipeline until it exits;
 /// the quit signal that ended it, for the caller to re-raise.
@@ -156,7 +158,7 @@ pub(crate) fn build_source_set(
     fn boxed(src: impl DynSource) -> Box<dyn DynSource> {
         Box::new(src)
     }
-    [
+    let sources: Vec<Box<dyn DynSource>> = [
         Some(boxed(hook_router)),
         ClaudeCodeSource::default_paths().map(boxed),
         AntigravitySource::default_paths().map(boxed),
@@ -167,7 +169,16 @@ pub(crate) fn build_source_set(
     ]
     .into_iter()
     .flatten()
-    .collect()
+    .collect();
+    #[cfg(feature = "t3-code-observer")]
+    let sources = {
+        let mut sources = sources;
+        if let Some(credential) = crate::t3_code::load_credential() {
+            sources.push(boxed(T3CodeSource::new(credential)));
+        }
+        sources
+    };
+    sources
 }
 
 #[cfg(test)]

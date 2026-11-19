@@ -23,6 +23,15 @@ pub enum Transport {
     Hook,
     /// Read from a transcript JSONL file (may be a historical replay).
     Jsonl,
+    /// Live remote state can answer current requests; a replayed end may predate them.
+    Observer,
+}
+
+impl Transport {
+    /// Whether a turnless end can answer a current request that replayed history may predate.
+    pub(crate) const fn is_live(self) -> bool {
+        matches!(self, Self::Hook | Self::Observer)
+    }
 }
 
 /// Structured tool detail, so the reducer can pattern-match (instead of

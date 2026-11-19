@@ -218,6 +218,15 @@ pub(crate) enum Cmd {
         #[command(flatten)]
         output: JsonArgs,
     },
+    /// Pair with a T3 Code environment for read-only activity observation.
+    ///
+    /// `connect` reads a pairing URL or code from stdin. A code is followed by
+    /// the server URL. `disconnect` removes the locally stored read token.
+    #[cfg(feature = "t3-code-observer")]
+    T3 {
+        #[command(subcommand)]
+        action: T3Action,
+    },
     /// First-run setup: detect installed agent CLIs and connect them.
     ///
     /// The headless twin of the in-TUI onboarding. Without `--yes` it's a DRY RUN
@@ -262,6 +271,15 @@ pub(crate) enum SourcesAction {
         #[command(flatten)]
         sources: SourceIdArgs,
     },
+}
+
+#[derive(Debug, Subcommand)]
+#[cfg(feature = "t3-code-observer")]
+pub(crate) enum T3Action {
+    /// Connect using a one-time pairing URL or code pasted into stdin.
+    Connect,
+    /// Remove the saved T3 Code read token from this machine.
+    Disconnect,
 }
 
 /// `--log-level` values. A typed enum (not a free `String`) so a typo like
@@ -729,6 +747,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "t3-code-observer")]
+    fn t3_pairing_commands_parse_without_exposing_tokens_as_arguments() {
+        let connect = Cli::try_parse_from(["pixtuoid", "t3", "connect"]).unwrap();
+        assert!(matches!(
+            connect.cmd,
+            Some(Cmd::T3 {
+                action: T3Action::Connect
+            })
+        ));
+        let disconnect = Cli::try_parse_from(["pixtuoid", "t3", "disconnect"]).unwrap();
+        assert!(matches!(
+            disconnect.cmd,
+            Some(Cmd::T3 {
+                action: T3Action::Disconnect
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["pixtuoid", "t3", "connect", "https://t3.example/pair"]).is_err()
+        );
     }
 
     #[test]

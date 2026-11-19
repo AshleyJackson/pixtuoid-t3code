@@ -75,6 +75,8 @@ yaml-edit          = { version = "0.3.6", default-features = false }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Optional so no-default-features cross-lints do not build ring's C backend.
+reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"], optional = true }
 # The log sinks' worker thread, which a stalled reader or a hung disk parks
 # instead of the `tracing` caller.
 tracing-appender   = "0.2"
@@ -136,12 +138,13 @@ rtrb = { version = "0.4.0", optional = true }
 # `portable` is the build docs/CONFIGURATION.md offers where libasound is
 # absent, so a new default feature goes in it unless it needs a system library.
 default = ["audio", "portable"]
-portable = ["serve"]
+portable = ["serve", "t3-code-observer"]
 # Ambient sound (config-OFF at runtime regardless; this gates the DEPENDENCY).
 audio = ["dep:rodio", "dep:rtrb"]
 # `pixtuoid serve` and `pixtuoid pair`. ring's build script compiles C for the
 # target, whose headers the cross-lints don't have, so they leave this out.
 serve = ["dep:tokio-rustls", "dep:rcgen", "dep:ring", "dep:qrcode", "dep:whoami", "dep:zbus"]
+t3-code-observer = ["dep:reqwest"]
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

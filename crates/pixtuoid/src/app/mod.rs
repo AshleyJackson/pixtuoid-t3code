@@ -7,8 +7,6 @@ mod crash;
 pub(crate) mod logging;
 mod sources_cli;
 
-#[cfg(feature = "t3-code-observer")]
-use std::io::BufRead as _;
 use std::io::Write;
 
 #[cfg(feature = "t3-code-observer")]
@@ -111,6 +109,50 @@ pub fn run() -> Result<()> {
         signal.reraise();
     }
     Ok(())
+}
+
+#[cfg(feature = "t3-code-observer")]
+enum T3ConnectionInput {
+    PairingUrl(String),
+    PairingCode { code: String, server_url: String },
+}
+
+#[cfg(feature = "t3-code-observer")]
+fn read_t3_connection_input(
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl Write,
+) -> Result<T3ConnectionInput> {
+    writeln!(
+        writer,
+        "Paste a one-time T3 Code pairing URL or code and press Enter:"
+    )?;
+    let mut input = String::new();
+    reader
+        .read_line(&mut input)
+        .context("reading the T3 Code pairing input")?;
+    match t3_code::parse_pairing_input(&input)? {
+        t3_code::PairingInput::Url(url) => Ok(T3ConnectionInput::PairingUrl(url)),
+        t3_code::PairingInput::Code(code) => {
+            writeln!(
+                writer,
+                "Enter the T3 Code server base URL (HTTPS, or loopback HTTP) and press Enter:"
+            )?;
+            let mut server_url = String::new();
+            reader
+                .read_line(&mut server_url)
+                .context("reading the T3 Code server URL")?;
+            let server_url = server_url.trim();
+            if server_url.is_empty() {
+                anyhow::bail!(
+                    "T3 Code server URL is required when connecting with a pairing code."
+                );
+            }
+            Ok(T3ConnectionInput::PairingCode {
+                code,
+                server_url: server_url.to_owned(),
+            })
+        }
+    }
 }
 
 /// Run `cmd`: apart from [`run`] so every failure in it, a `?` included,
@@ -220,21 +262,19 @@ fn dispatch(cmd: Cmd, drift: doctor::DriftSeen) -> Result<Option<runtime::QuitSi
         Cmd::T3 {
             action: T3Action::Connect,
         } => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "Paste the one-time T3 Code pairing URL and press Enter:"
-            );
-            let mut pairing_url = String::new();
-            std::io::stdin()
-                .lock()
-                .read_line(&mut pairing_url)
-                .context("reading the T3 Code pairing URL")?;
-            let pairing_url = pairing_url.trim();
-            if pairing_url.is_empty() {
-                anyhow::bail!("T3 Code pairing URL is required.");
-            }
-            let credential =
-                runtime::on_runtime(|rt| rt.block_on(t3_code::exchange_pairing_url(pairing_url)))??;
+            let stdin = std::io::stdin();
+            let mut stdin = stdin.lock();
+            let mut stderr = std::io::stderr();
+            let credential = match read_t3_connection_input(&mut stdin, &mut stderr)? {
+                T3ConnectionInput::PairingUrl(pairing_url) => runtime::on_runtime(|rt| {
+                    rt.block_on(t3_code::exchange_pairing_url(&pairing_url))
+                })??,
+                T3ConnectionInput::PairingCode { code, server_url } => {
+                    runtime::on_runtime(|rt| {
+                        rt.block_on(t3_code::exchange_pairing_code(&server_url, &code))
+                    })??
+                }
+            };
             t3_code::save_credential(&credential)?;
             writeln!(crate::cli_stdout(), "Connected to T3 Code (read-only).")?;
             None
@@ -406,6 +446,41 @@ mod tests {
             broken_install_warning("hermes", &doctor::SourceDiagnostics::default()),
             None
         );
+    }
+
+    #[cfg(feature = "t3-code-observer")]
+    #[test]
+    fn t3_connect_reads_pairing_code_and_server_url_from_stdin() {
+        let mut input = std::io::Cursor::new("0123456789AB\nhttps://t3.example\n");
+        let mut output = Vec::new();
+        let result = read_t3_connection_input(&mut input, &mut output).expect("pairing input");
+        assert!(matches!(
+            result,
+            T3ConnectionInput::PairingCode { code, server_url }
+                if code == "0123456789AB" && server_url == "https://t3.example"
+        ));
+        let output = String::from_utf8(output).expect("prompt text");
+        assert!(output.contains("pairing URL or code"));
+        assert!(output.contains("server base URL"));
+    }
+
+    #[cfg(feature = "t3-code-observer")]
+    #[test]
+    fn t3_connect_keeps_pairing_url_as_a_single_input() {
+        use std::io::BufRead as _;
+
+        let mut input =
+            std::io::Cursor::new("http://127.0.0.1:3773/pair#token=one-time\nremaining input\n");
+        let mut output = Vec::new();
+        let result = read_t3_connection_input(&mut input, &mut output).expect("pairing input");
+        assert!(matches!(
+            result,
+            T3ConnectionInput::PairingUrl(url)
+                if url == "http://127.0.0.1:3773/pair#token=one-time"
+        ));
+        let mut remaining = String::new();
+        input.read_line(&mut remaining).expect("remaining input");
+        assert_eq!(remaining, "remaining input\n");
     }
 
     #[test]

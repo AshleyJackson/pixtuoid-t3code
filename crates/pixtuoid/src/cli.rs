@@ -220,8 +220,8 @@ pub(crate) enum Cmd {
     },
     /// Pair with a T3 Code environment for read-only activity observation.
     ///
-    /// `connect` reads the one-time pairing URL from stdin; `disconnect` removes
-    /// the locally stored read token.
+    /// `connect` reads a pairing URL or code from stdin. A code is followed by
+    /// the server URL. `disconnect` removes the locally stored read token.
     #[cfg(feature = "t3-code-observer")]
     T3 {
         #[command(subcommand)]
@@ -276,7 +276,7 @@ pub(crate) enum SourcesAction {
 #[derive(Debug, Subcommand)]
 #[cfg(feature = "t3-code-observer")]
 pub(crate) enum T3Action {
-    /// Connect using a one-time pairing URL pasted into stdin.
+    /// Connect using a one-time pairing URL or code pasted into stdin.
     Connect,
     /// Remove the saved T3 Code read token from this machine.
     Disconnect,

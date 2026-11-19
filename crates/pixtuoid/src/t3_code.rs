@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
@@ -26,6 +27,8 @@ const PROTOCOL_VERSION: &str = "2";
 const MAX_THREAD_ID_BYTES: usize = 256;
 const MAX_CREDENTIAL_BYTES: u64 = 8 * 1024;
 const MAX_SHELL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+// Bound the path copied into each queued `SessionStart` event.
+const MAX_WORKSPACE_ROOT_BYTES: usize = 128 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: usize = MAX_CREDENTIAL_BYTES as usize;
 const OBSERVED_CALL_ID: &str = "t3-observed-turn";
 const OBSERVED_TOOL_NAME: &str = "T3";
@@ -69,7 +72,7 @@ enum ObservedStatus {
 
 struct ObservedThread {
     id: String,
-    project_dir: String,
+    project_dir: Arc<str>,
     status: ObservedStatus,
 }
 
@@ -267,6 +270,27 @@ fn parse_pairing_url(input: &str) -> Result<(String, String)> {
     Ok((base_url, token))
 }
 
+pub(crate) enum PairingInput {
+    Url(String),
+    Code(String),
+}
+
+pub(crate) fn parse_pairing_input(input: &str) -> Result<PairingInput> {
+    let input = input.trim();
+    if input.is_empty() {
+        bail!("T3 Code pairing URL or code is required.");
+    }
+    if input.contains("://") {
+        parse_pairing_url(input)?;
+        Ok(PairingInput::Url(input.to_owned()))
+    } else {
+        if input.chars().any(char::is_whitespace) {
+            bail!("T3 Code pairing code must not contain whitespace.");
+        }
+        Ok(PairingInput::Code(input.to_owned()))
+    }
+}
+
 fn shell_snapshot_url(base_url: &str) -> Result<String> {
     let mut url = validate_base_url(base_url)?;
     let base_path = url.path().trim_end_matches('/');
@@ -311,12 +335,32 @@ async fn read_bounded_response(
 
 pub(crate) async fn exchange_pairing_url(input: &str) -> Result<T3CodeCredential> {
     let (base_url, bootstrap_token) = parse_pairing_url(input)?;
+    exchange_pairing_token(base_url, &bootstrap_token).await
+}
+
+pub(crate) async fn exchange_pairing_code(
+    server_url: &str,
+    pairing_code: &str,
+) -> Result<T3CodeCredential> {
+    let code = pairing_code.trim();
+    if code.is_empty() || code.chars().any(char::is_whitespace) {
+        bail!("T3 Code pairing code must not be empty or contain whitespace.");
+    }
+    let server_url = validate_base_url(server_url)?;
+    let base_url = server_url.as_str().trim_end_matches('/').to_owned();
+    exchange_pairing_token(base_url, code).await
+}
+
+async fn exchange_pairing_token(
+    base_url: String,
+    bootstrap_token: &str,
+) -> Result<T3CodeCredential> {
     let client = http_client()?;
     let response = client
         .post(format!("{base_url}/oauth/token"))
         .form(&[
             ("grant_type", TOKEN_EXCHANGE_GRANT),
-            ("subject_token", bootstrap_token.as_str()),
+            ("subject_token", bootstrap_token),
             ("subject_token_type", BOOTSTRAP_TOKEN_TYPE),
             ("requested_token_type", ACCESS_TOKEN_TYPE),
             ("scope", TOKEN_SCOPE),
@@ -422,8 +466,9 @@ fn normalize_shell_snapshot(raw: Value) -> Result<Vec<ObservedThread>> {
         let id = string_field(project.get("id"))
             .ok_or_else(|| anyhow::anyhow!("invalid T3 Code project identity"))?;
         let workspace_root = string_field(project.get("workspaceRoot"))
+            .filter(|path| path.len() <= MAX_WORKSPACE_ROOT_BYTES)
             .ok_or_else(|| anyhow::anyhow!("invalid T3 Code project identity"))?;
-        project_dirs.insert(id.to_owned(), workspace_root.to_owned());
+        project_dirs.insert(id.to_owned(), Arc::<str>::from(workspace_root));
     }
 
     let mut observed = Vec::new();
@@ -479,7 +524,10 @@ fn normalize_shell_snapshot(raw: Value) -> Result<Vec<ObservedThread>> {
         let project_id = string_field(thread.get("projectId")).unwrap_or_default();
         observed.push(ObservedThread {
             id: id.to_owned(),
-            project_dir: project_dirs.get(project_id).cloned().unwrap_or_default(),
+            project_dir: project_dirs
+                .get(project_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::from("")),
             status: observed_status,
         });
     }
@@ -593,7 +641,7 @@ impl T3CodeSource {
         let cwd = if thread.project_dir.is_empty() {
             PathBuf::from("T3 Code")
         } else {
-            PathBuf::from(&thread.project_dir)
+            PathBuf::from(thread.project_dir.as_ref())
         };
         send_event(
             tx,
@@ -766,9 +814,9 @@ mod tests {
 
     use super::{
         AgentEvent, MAX_CREDENTIAL_BYTES, MAX_SHELL_RESPONSE_BYTES, MAX_TOKEN_RESPONSE_BYTES,
-        ObservedStatus, ObservedThread, T3CodeCredential, T3CodeSource, TrackedThread, Transport,
-        normalize_shell_snapshot, parse_pairing_url, save_credential_at, shell_snapshot_url,
-        transition_events,
+        MAX_WORKSPACE_ROOT_BYTES, ObservedStatus, ObservedThread, PairingInput, T3CodeCredential,
+        T3CodeSource, TrackedThread, Transport, normalize_shell_snapshot, parse_pairing_input,
+        parse_pairing_url, save_credential_at, shell_snapshot_url, transition_events,
     };
 
     fn credential(token: &str) -> T3CodeCredential {
@@ -1009,17 +1057,58 @@ mod tests {
                 ("input", ObservedStatus::Input)
             ]
         );
-        assert_eq!(threads[0].project_dir, "/work/demo");
+        assert_eq!(threads[0].project_dir.as_ref(), "/work/demo");
+        assert_eq!(
+            threads[0].project_dir.as_ptr(),
+            threads[1].project_dir.as_ptr()
+        );
         let serialized = serde_json::to_string(
             &threads
                 .iter()
-                .map(|thread| (&thread.id, &thread.project_dir))
+                .map(|thread| (&thread.id, thread.project_dir.as_ref()))
                 .collect::<Vec<_>>(),
         )
         .expect("normalized values serialize");
         assert!(!serialized.contains("private project title"));
         assert!(!serialized.contains("private thread title"));
         assert!(!serialized.contains("run-1"));
+    }
+
+    #[test]
+    fn snapshot_accepts_workspace_roots_at_the_size_limit() {
+        let workspace_root = "x".repeat(MAX_WORKSPACE_ROOT_BYTES);
+        let snapshot = json!({
+            "projects": [{
+                "id": "project-1",
+                "workspaceRoot": workspace_root.clone()
+            }],
+            "threads": [
+                {"id": "thread-1", "projectId": "project-1", "status": "running"}
+            ]
+        });
+        let threads = normalize_shell_snapshot(snapshot).expect("workspace root at limit");
+        assert_eq!(threads[0].project_dir.as_ref(), workspace_root.as_str());
+    }
+
+    #[test]
+    fn snapshot_rejects_oversized_workspace_roots_before_expanding_threads() {
+        let snapshot = json!({
+            "projects": [{
+                "id": "project-1",
+                "workspaceRoot": "x".repeat(MAX_WORKSPACE_ROOT_BYTES + 1)
+            }],
+            "threads": [
+                {"id": "thread-1", "projectId": "project-1", "status": "running"},
+                {"id": "thread-2", "projectId": "project-1", "status": "running"}
+            ]
+        });
+        assert!(
+            serde_json::to_vec(&snapshot)
+                .expect("serialize snapshot")
+                .len()
+                < MAX_SHELL_RESPONSE_BYTES
+        );
+        assert!(normalize_shell_snapshot(snapshot).is_err());
     }
 
     #[test]
@@ -1056,6 +1145,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pairing_input_accepts_a_code_or_url() {
+        assert!(matches!(
+            parse_pairing_input(" 0123456789AB \n"),
+            Ok(PairingInput::Code(code)) if code == "0123456789AB"
+        ));
+        assert!(matches!(
+            parse_pairing_input(" http://127.0.0.1:3773/pair#token=one-time \n"),
+            Ok(PairingInput::Url(url)) if url == "http://127.0.0.1:3773/pair#token=one-time"
+        ));
+        assert!(parse_pairing_input(" \n").is_err());
+    }
+
     #[tokio::test]
     async fn pairing_exchange_requests_only_the_read_scope() {
         let (base_url, server) = serve_once(
@@ -1083,6 +1185,23 @@ mod tests {
         }
         assert_eq!(credential.token, "read-token");
         assert!(!format!("{credential:?}").contains("read-token"));
+    }
+
+    #[tokio::test]
+    async fn pairing_code_exchange_uses_the_supplied_server_url() {
+        let (base_url, server) = serve_once(
+            r#"{"access_token":"read-token","token_type":"Bearer","scope":"orchestration:read","expires_in":60}"#,
+        )
+        .await;
+        let credential = super::exchange_pairing_code(&base_url, "0123456789AB")
+            .await
+            .expect("exchange pairing code");
+        let request = server.await.expect("local HTTP server");
+
+        assert!(request.starts_with("POST /oauth/token HTTP/1.1"));
+        assert!(request.contains("subject_token=0123456789AB"));
+        assert_eq!(credential.base_url, base_url);
+        assert_eq!(credential.token, "read-token");
     }
 
     #[tokio::test]
@@ -1196,7 +1315,7 @@ mod tests {
         let mut tracked = std::collections::HashMap::<String, TrackedThread>::new();
         let waiting = ObservedThread {
             id: "thread-1".to_owned(),
-            project_dir: "/work/demo".to_owned(),
+            project_dir: "/work/demo".into(),
             status: ObservedStatus::Permission,
         };
 
@@ -1218,7 +1337,7 @@ mod tests {
 
         let active = ObservedThread {
             id: "thread-1".to_owned(),
-            project_dir: "/work/demo".to_owned(),
+            project_dir: "/work/demo".into(),
             status: ObservedStatus::Active,
         };
         assert!(
@@ -1265,7 +1384,7 @@ mod tests {
         let snapshot = || {
             vec![ObservedThread {
                 id: "thread-1".to_owned(),
-                project_dir: "/work/demo".to_owned(),
+                project_dir: "/work/demo".into(),
                 status: ObservedStatus::Active,
             }]
         };
